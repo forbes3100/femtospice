@@ -21,6 +21,8 @@ import re
 import time
 import numpy as np
 import sympy
+import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
 import siunits as si
 
 verbose = 0
@@ -28,10 +30,12 @@ verbose = 0
 
 def parse_deck(deck):
     """Parse Spice file into a graph, comps, and edges"""
-    global graph, comps, edges, title, dt, tstop, tstart, tmax, printed_comps
+    global graph, comps, edges, title, dt, tstop, tstart, tmax, prints, plots
     graph = {}
     comps = {}
     edges = {}
+    prints = []
+    plots = []
 
     with open(deck) as f:
         lines = f.readlines()
@@ -56,15 +60,18 @@ def parse_deck(deck):
                         si.floatSI(w) for w in words[1:]
                     ]
                     continue
-                elif cmd == 'print':
+                elif cmd in ('print', 'plot'):
+                    args = []
                     if words[1] == 'all':
-                        printed_comps = 'all'
+                        args = 'all'
                     else:
-                        printed_comps = [
-                            f"{w[0]}{w[2:-1].lower()}" for w in words[1:]
-                        ]
+                        args = [f"{w[0]}{w[2:-1].lower()}" for w in words[1:]]
                     if verbose >= 2:
-                        print(printed_comps)
+                        print(args)
+                    if cmd == 'print':
+                        prints = args
+                    else:
+                        plots = args
                     continue
                 elif words[0] == '' or line[0] == '.' or in_control:
                     continue
@@ -267,6 +274,109 @@ def rk4_step(y0, h, f):
     return y0 + (1.0 / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
 
 
+class Figure:
+    """A matplotlib figure window"""
+
+    winx = None
+    winy = None
+    num = 1
+
+    def __init__(self):
+        # create a matplotlib plot
+        self.figure = plt.figure(Figure.num, figsize=(6, 3.5))
+        self.figure.clear()
+        Figure.num += 1
+        self.ax = plt.axes()
+        self.max_x = 0.0
+        self.ylabel = ""
+
+
+class NFmtr(ticker.Formatter):
+    def __init__(self, scale_x):
+        self.scale_x = scale_x
+
+    def __call__(self, x, pos=None):
+        return "{0:g}".format(x / 10**self.scale_x)
+
+
+def plot(plot_data):
+    global title, plot_var_names
+    print(f"Plotting {len(plot_data)} points")
+    plt.rcParams.update({'mathtext.default': 'regular'})
+    plt.rcParams.update({'font.size': 9})
+    fig = Figure()
+    plt.figure(fig.figure.number)
+    fig.title = title
+
+    times = []
+    for row in plot_data:
+        times.append(row[0])
+
+    min_y = 1e15
+    max_y = -1e15
+    for i, name in enumerate(plot_var_names):
+        ys = []
+        for row in plot_data:
+            value = row[i + 1]
+            ys.append(value)
+            min_y = min(value, min_y)
+            max_y = max(value, max_y)
+        plt.plot(times, ys.copy(), label=name)
+    fig.min_y = min_y
+    fig.max_y = max_y
+
+    fig.xlabel = "time"
+    fig.xunit = "s"
+    fig.max_x = max(plot_data[-1][0], fig.max_x)
+
+    fig.ylabel = f"voltage (%sV)"
+
+    fm = plt.get_current_fig_manager()
+    fm.set_window_title(title)
+
+    plt.ticklabel_format(axis='both', style='sci', scilimits=(-2, 2))
+    x_si = si.si(fig.max_x)
+    range_y = fig.max_y - fig.min_y
+    y_si = si.si(range_y)
+    units_x = x_si[-1]
+    if units_x.isdigit():
+        units_x = ''
+    units_y = y_si[-1]
+    if units_y.isdigit():
+        units_y = ''
+    scale_x = si.SIPowers.get(units_x)
+    scale_y = si.SIPowers.get(units_y)
+    if verbose >= 2:
+        print(f"{fig.min_y=} {fig.max_y=} {range_y=} {y_si=}")
+        print(f"{fig.ylabel=} {units_y=} {scale_y=}")
+    if scale_x is not None:
+        if verbose >= 2:
+            print(f"Scaling plot X axis by {10**scale_x:g} ({units_x})")
+        fig.ax.xaxis.set_major_formatter(NFmtr(scale_x))
+    else:
+        units_x = ''
+    if scale_y is not None:
+        fig.ax.yaxis.set_major_formatter(NFmtr(scale_y))
+    else:
+        units_y = ''
+    plt.xlabel(f"{fig.xlabel} ({units_x}{fig.xunit})")
+    plt.ylabel(fig.ylabel % units_y)
+
+    plt.grid(True)
+    plt.subplots_adjust(left=0.10, top=0.90, right=0.97, bottom=0.15)
+    plt.legend(
+        bbox_to_anchor=(0.0, 1.02, 1.0, 0.102),
+        loc='lower left',
+        ncol=min(len(plots), 6),
+        mode="expand",
+        borderaxespad=0.0,
+        frameon=False,
+    )
+    plt.margins(0)
+    ##plt.show(block=False)
+    plt.show()
+
+
 def eqns_source(x_comps, solution_eqns, offset):
     """generate python source for each component in x_comps"""
     source = ''
@@ -326,9 +436,35 @@ def find_gnd(node, path):
     return None
 
 
+def get_var_name(var, vi_comp_names):
+    """Get a variable's printing name, adding a node eqn if needed"""
+    global loop_source
+
+    v_i = var[0]
+    node = var[1:]
+    name = f"{v_i}({node})"
+
+    if v_i == 'v' and not var in vi_comp_names:
+        if verbose >= 2:
+            print(f"node '{var}' missing, building eqn")
+        if not node in graph.keys():
+            raise ValueError(f"unknown node '{node}'")
+        vi_comp_names.append(var)
+
+        # find a route to node 0 from this node for voltage
+        visited = set()
+        gnd_comps = find_gnd(node, [])
+        if len(gnd_comps) == 0:
+            raise ValueError(f"can't find ground path for node '{node}'")
+        var_eqn = ' + '.join(gnd_comps)
+
+        loop_source += f"    {var} = {var_eqn}\n"
+    return name
+
+
 def build_py_source():
     """generate python source for circuit simulation"""
-    global printed_comps, visited
+    global prints, plots, plot_var_names, visited, loop_source
     n_comps = len(comps)
     if n_comps == 0:
         raise ValueError("No components in circuit")
@@ -481,51 +617,52 @@ def build_py_source():
         source += f"{var}_ = 0\n"
 
     vi_comp_names = [c.name for c in vi_comps]
-    if printed_comps == 'all':
-        printed_comps = vi_comp_names
-
-    var_names = var_fmts = ''
-    for var in printed_comps:
-        v_i = var[0]
-        node = var[1:]
-        name = f"{v_i}({node})"
-        var_names += f" {name:13}"
-        var_fmts += f"  {{{var}: 11.5e}}"
-
-        if v_i == 'v' and not var in vi_comp_names:
-            if verbose >= 2:
-                print(f"node '{var}' missing, building eqn")
-            if not node in graph.keys():
-                raise ValueError(f"unknown node '{node}'")
-
-            # find a route to node 0 from this node for voltage
-            visited = set()
-            gnd_comps = find_gnd(node, [])
-            if len(gnd_comps) == 0:
-                raise ValueError(f"can't find ground path for node '{node}'")
-            var_eqn = ' + '.join(gnd_comps)
-
-            loop_source += f"    {var} = {var_eqn}\n"
-
+    if prints == 'all':
+        prints = vi_comp_names
+    if plots == 'all':
+        plots = vi_comp_names
     title2 = f"Transient Analysis  {time.asctime()}"
-    source += f"""
+
+    if len(prints) > 0:
+        var_names = var_fmts = ''
+        for var in prints:
+            v_i = var[0]
+            node = var[1:]
+            name = get_var_name(var, vi_comp_names)
+            var_names += f" {name:13}"
+            var_fmts += f"  {{{var}: 11.5e}}"
+
+        source += f"""
 print("\\n{' '*((80 - len(title))//2)}{title}")
 print("{' '*((80 - len(title2))//2)}{title2}")
-div_line = '-'*{21 + 14*len(printed_comps)}
+div_line = '-'*{21 + 14*len(prints)}
 print(div_line)
 print("Index     time         {var_names}")
 print(div_line)
+"""
 
+    if len(plots) > 0:
+        plot_var_names = []
+        for var in plots:
+            name = get_var_name(var, vi_comp_names)
+            plot_var_names.append(name)
+        source += "plot_data = []\n"
+
+    source += f"""
 nh = 100
 h = dt / nh
 i = 0
 t = tstart
-tstop += dt
 while t <= tstop:
-{loop_source}
-    if i % nh == 0:
+{loop_source}"""
+
+    if len(prints) > 0:
+        source += f"""    if i % nh == 0:
         print(f"{{int(i/nh):<8d}} {{t: 11.5e}}{var_fmts}")
 """
+    if len(plots) > 0:
+        source += f"    plot_data.append([t,{', '.join(plots)}])\n"
+
     for var in integ_comps:
         source += f"    {var}_ = rk4_step({var}, h, d{var})\n"
 
@@ -535,6 +672,9 @@ while t <= tstop:
     source += """    t += h
     i += 1
 """
+
+    if len(plots) > 0:
+        source += "\nplot(plot_data)\n"
 
     if verbose >= 1:
         div_line = '-' * 56
