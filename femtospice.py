@@ -19,6 +19,8 @@
 import sys
 import re
 import time
+import sysv_ipc
+import struct
 import numpy as np
 import sympy
 import matplotlib.pyplot as plt
@@ -26,6 +28,9 @@ import matplotlib.ticker as ticker
 import siunits as si
 
 verbose = 0
+shm = None
+BUF_SIZE = 64
+READY_SEM_ID = 23
 
 
 def parse_deck(deck):
@@ -72,6 +77,9 @@ def parse_deck(deck):
                         prints = args
                     else:
                         plots = args
+                    continue
+                elif cmd == 'serve':
+                    start_server()
                     continue
                 elif words[0] == '' or line[0] == '.' or in_control:
                     continue
@@ -648,6 +656,8 @@ print(div_line)
             plot_var_names.append(name)
         source += "plot_data = []\n"
 
+    shares_s = ', '.join(['vc1'])
+
     source += f"""
 nh = 100
 h = dt / nh
@@ -661,7 +671,10 @@ while t <= tstop:
         print(f"{{int(i/nh):<8d}} {{t: 11.5e}}{var_fmts}")
 """
     if len(plots) > 0:
-        source += f"    plot_data.append([t,{', '.join(plots)}])\n"
+        source += f"    plot_data.append([t, {', '.join(plots)}])\n"
+
+    if shm:
+        source += f"    [{shares_s}] = share([t, {shares_s}])\n"
 
     for var in integ_comps:
         source += f"    {var}_ = rk4_step({var}, h, d{var})\n"
@@ -694,6 +707,40 @@ def print_comps():
     print("\ncomps:")
     for comp, (edge_name, edge_dir, value) in comps.items():
         print(f"  {comp} {edge_name} {edge_dir} {si.si(value)}")
+
+def start_server():
+    global shm, out_sem, in_sem
+
+    # Open shared memory block
+    shm = sysv_ipc.SharedMemory(1234, sysv_ipc.IPC_CREAT, size=BUF_SIZE*8)
+    print(f"start_server: {shm=}")
+    out_sem = sysv_ipc.Semaphore(READY_SEM_ID, sysv_ipc.IPC_CREAT)
+    in_sem = sysv_ipc.Semaphore(READY_SEM_ID+1, sysv_ipc.IPC_CREAT)
+    print(f"start_server: {out_sem=} {in_sem=}")
+
+    # Clear buffer
+    for i in range(BUF_SIZE):
+        shm.write(struct.pack('d', 0.))
+
+
+def share(data):
+    """Share results of this sim step with co-routine"""
+    global shm, out_sem, in_sem
+
+    # write data to shared data buffer, in C form
+    print(f"{data} -> share")
+    n = len(data)
+    shm.write(struct.pack('d'*n, *data))
+
+    # set semaphore to tell co-routine data is ready
+    out_sem.release()
+    # wait for return data
+    in_sem.acquire()
+
+    n -= 1
+    data_ = struct.unpack('d'*n, shm.read(8*n, 8))
+    print(f"share -> {data_}")
+    return data_
 
 
 def compile_and_run(deck):
