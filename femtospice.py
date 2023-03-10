@@ -26,90 +26,8 @@ import matplotlib.ticker as ticker
 import siunits as si
 
 verbose = 0
-
-
-def parse_deck(deck):
-    """Parse Spice file into a graph, comps, and edges"""
-    global graph, comps, edges, title, dt, tstop, tstart, tmax, prints, plots
-    graph = {}
-    comps = {}
-    edges = {}
-    prints = []
-    plots = []
-
-    with open(deck) as f:
-        lines = f.readlines()
-        title = lines[0].strip()
-        in_control = False
-
-        for line in lines[1:]:
-            line = line.split('*')[0].strip()
-            if verbose >= 3:
-                print(f"'{line}'")
-            words = re.split("[\s\t]+", line)
-            if len(words) >= 1:
-                cmd = words[0][:5]
-                if cmd == '.cont':
-                    in_control = True
-                    continue
-                elif cmd == '.endc':
-                    in_control = False
-                    continue
-                elif cmd == '.tran':
-                    dt, tstop, tstart, tmax = [
-                        si.floatSI(w) for w in words[1:]
-                    ]
-                    continue
-                elif cmd in ('print', 'plot'):
-                    args = []
-                    if words[1] == 'all':
-                        args = 'all'
-                    else:
-                        args = [f"{w[0]}{w[2:-1].lower()}" for w in words[1:]]
-                    if verbose >= 2:
-                        print(args)
-                    if cmd == 'print':
-                        prints = args
-                    else:
-                        plots = args
-                    continue
-                elif words[0] == '' or line[0] == '.' or in_control:
-                    continue
-            if len(words) >= 4:
-                comp, node1, node2, value_s = words[:4]
-                comp = comp.lower()
-                node1 = node1.lower()
-                node2 = node2.lower()
-                if comp[0] == 'v':
-                    if value_s == 'pwl(0':
-                        value_s = words[6][:-1]
-                    elif value_s == 'ac':
-                        value_s = words[4]
-                value = si.floatSI(value_s)
-                if comp[0] in "vrlc":
-                    edge_nm = f"{node1},:{comp},{node2}"
-                    edge_dir = 1
-                    if node1 > node2:
-                        edge_dir = -1
-                        value = -value
-                        edge_nm = f"{node2},:{comp},{node1}"
-                    if comp in comps:
-                        raise ValueError(f"Duplicate component {comp}")
-                    comps[comp] = (edge_nm, edge_dir, value)
-                    if not edge_nm in edges:
-                        edges[edge_nm] = []
-                    edges[edge_nm].append(comp)
-                if node1 not in graph:
-                    graph[node1] = []
-                if node2 not in graph:
-                    graph[node2] = []
-                graph[node1].append((node2, comp))
-                graph[node2].append((node1, comp))
-            else:
-                print(f"*** WARNING: unrecognized line '{line}'")
-
-    if verbose >= 1:
-        print(f"{edges=}")
+prints = []
+plots = []
 
 
 def normalize_path(path):
@@ -150,8 +68,8 @@ def search(curr, curr_comp=None, path=[], indent=''):
     if verbose >= 2:
         print(f"{indent}appended. {path=}")
     for neighbor, comp in graph[curr]:
-        comp_edge, _, _ = comps[comp]
-        n_comps_edge = len(edges[comp_edge])
+        comp_edge_nm, _, _, _ = comps[comp]
+        n_comps_edge = len(edges[comp_edge_nm])
 
         path1 = path.copy()
         path1.append(':' + comp)
@@ -159,7 +77,7 @@ def search(curr, curr_comp=None, path=[], indent=''):
         if verbose >= 2:
             print(
                 f"{indent}{neighbor=}, {n_comps_edge=}  {path=} "
-                f"{comp_edge=} {visited=}, {visited_comps=}"
+                f"{comp_edge_nm=} {visited=}, {visited_comps=}"
             )
         if neighbor not in visited:
             # keep searching deeper
@@ -399,7 +317,7 @@ def eqns_source(x_comps, solution_eqns, offset):
 
 
 def signed_comp(comp, node):
-    edge_nm, edge_dir, _ = comps[comp]
+    edge_nm, edge_dir, _, _ = comps[comp]
     edge_node1, _, edge_node2 = edge_nm.split(',')
     sign = 1 if edge_node1 == node else -1
     sign *= edge_dir
@@ -462,6 +380,19 @@ def get_var_name(var, vi_comp_names):
     return name
 
 
+def pwl(t, *args):
+    """Piecewise linear interpolation of (time, voltage) pairs"""
+    t0 = -1
+    v0 = 0
+    for i in range(0, len(args), 2):
+        t1, v1 = args[i : i + 2]
+        if t1 >= t:
+            return v0 + (t - t0) * (v1 - v0) / (t1 - t0)
+        t0 = t1
+        v0 = v1
+    return v1
+
+
 def build_py_source():
     """generate python source for circuit simulation"""
     global prints, plots, plot_var_names, visited, loop_source
@@ -494,7 +425,7 @@ def build_py_source():
 
         for edge, edge_dir in edges1.values():
             comp = edge[1][1:]
-            _, comp_dir, _ = comps[comp]
+            _, comp_dir, _, _ = comps[comp]
             if verbose >= 2:
                 print(f"  {comp}: {edge_dir} {comp_dir}")
             j = comps_list.index(comp)
@@ -507,7 +438,7 @@ def build_py_source():
         for (node2, comp) in graph[node1]:
             if verbose >= 2:
                 print(f"{node1},{node2} {comp}:")
-            edge2_name, comp_dir, _ = comps[comp]
+            edge2_name, comp_dir, _, _ = comps[comp]
             edge_dir = 1 if edge2_name == f"{node1},:{comp},{node2}" else -1
             if verbose >= 2:
                 print(f"  {comp}: {edge2_name} {edge_dir} {comp_dir}")
@@ -526,13 +457,15 @@ def build_py_source():
     dv_comps = []
     di_comps = []
 
-    for comp in comps.keys():
+    for comp, comp_data in comps.items():
+        print(f"{comp}: {comp_data}")
+        value = comp_data[2]
         v_comp = sympy.symbols(f"v{comp}")
         i_comp = sympy.symbols(f"i{comp}")
         v_comps.append(v_comp)
         i_comps.append(i_comp)
         ty = comp[0]
-        if ty == 'c':
+        if ty in 'c':
             dv_comp = sympy.symbols(f"dv{comp}")
             dv_comps.append(dv_comp)
         elif ty == 'l':
@@ -545,8 +478,12 @@ def build_py_source():
             eqn = v_comp - X * i_comp
         elif ty == 'c':
             eqn = dv_comp - i_comp / X
-        else:
+        elif ty == 'l':
             eqn = di_comp - v_comp / X
+        else:
+            raise ValueError(f"Unknown component type for '{comp}'")
+        if verbose >= 2:
+            print(f" --> {eqn}")
         eqns.append(eqn)
 
     # create voltage equation strings from KVL
@@ -584,9 +521,10 @@ def build_py_source():
             j += 1
 
     vi_comps = v_comps + i_comps
-    solution = sympy.linsolve(eqns, vi_comps)
     if verbose >= 1:
         print(f"\nsympy.linsolve({eqns}, {vi_comps})")
+    solution = sympy.linsolve(eqns, vi_comps)
+    if verbose >= 1:
         print(f"{solution=}")
     if len(solution) == 0:
         raise ValueError("No solution")
@@ -595,8 +533,24 @@ def build_py_source():
     # build circuit source code
     source = ''
     loop_source = ''
-    for comp, (_, _, value) in comps.items():
-        source += f"{comp.capitalize()} = {abs(value):0.10g}\n"
+    for comp, (_, _, value, args) in comps.items():
+        print(f"{comp} {value} {args}")
+        ty = comp[0]
+        sym = comp.capitalize()
+        if ty in 'iv':
+            if len(args) > 0:
+                fn_args = [f"{si.floatSI(arg)}" for arg in args[1:]]
+                loop_source += (
+                    f"    {sym} = {args[0]}(t, {', '.join(fn_args)})\n"
+                )
+                continue
+            else:
+                for i, w in enumerate(value):
+                    if w in ('ac', 'dc'):
+                        value = si.floatSI(value[i + 1])
+                        break
+        if ty != 'd':
+            source += f"{sym} = {abs(value):0.10g}\n"
 
     integ_comps = []
     for x_comp in vi_comps:
@@ -661,7 +615,7 @@ while t <= tstop:
         print(f"{{int(i/nh):<8d}} {{t: 11.5e}}{var_fmts}")
 """
     if len(plots) > 0:
-        source += f"    plot_data.append([t,{', '.join(plots)}])\n"
+        source += f"    plot_data.append([t, {', '.join(plots)}])\n"
 
     for var in integ_comps:
         source += f"    {var}_ = rk4_step({var}, h, d{var})\n"
@@ -684,16 +638,196 @@ while t <= tstop:
     return source
 
 
+def do_tran(vars):
+    print(f"tran {vars}")
+    global dt, tstop, tstart, tmax
+    dt, tstop, tstart, tmax = [si.floatSI(w) for w in vars]
+
+
+def parse_sub(name, lines, subs=None, indent=''):
+    """Parse a subcircuit"""
+    global graph, comps, edges, subckts, prints, plots
+    in_control = False
+
+    if verbose >= 1 and name is not None:
+        print(f"\n{indent}subckt {name}:")
+    for orig_line in lines:
+        line = orig_line.lower()
+        words = re.split(r'[ \t]+', line)
+        if verbose >= 2:
+            print(f"{indent}{line}")
+        cmd = words[0][:5]
+        if cmd == '.cont':
+            in_control = True
+        elif cmd == '.endc':
+            in_control = False
+        elif cmd == '.end':
+            break
+        elif cmd == '.tran':
+            do_tran(words[1:])
+        elif in_control:
+            if cmd == 'tran':
+                do_tran(words[1:])
+            elif cmd in ('print', 'plot'):
+                args = []
+                if words[1] == 'all':
+                    args = 'all'
+                else:
+                    args = [f"{w[0]}{w[2:-1]}" for w in words[1:]]
+                if verbose >= 2:
+                    print(args)
+                if words[0] == 'print':
+                    prints = args
+                else:
+                    plots = args
+            elif cmd == 'plot':
+                do_plot(words[1:])
+            elif cmd == 'echo':
+                m = re.search(r'"([^"]*)"', orig_line)
+                if m:
+                    print(m[0][1:-1])
+                else:
+                    print()
+        else:
+            ty = cmd[0]
+            if ty == 'x':
+                call_args = words[1:-1]
+                sub_name = words[-1]
+                sub_args, sub_lines = subckts[sub_name]
+                s = {}
+                for k, v in zip(sub_args, call_args):
+                    s[k] = v
+                xname = cmd[1:]
+                if name is not None:
+                    xname = f"{name}{xname}"
+                parse_sub(xname, sub_lines, s, indent + '  ')
+
+            else:
+                if len(words) < 4:
+                    raise SyntaxError(f"component missing args: {line}")
+                comp, node1, node2, value = words[:4]
+                args = []
+                if subs:
+                    comp = f"{comp[0]}{name}_{comp[1:]}"
+                    node1 = subs.get(node1, f"{name}_{node1}")
+                    node2 = subs.get(node2, f"{name}_{node2}")
+
+                ty = comp[0]
+                if ty in 'iv':
+                    # current or voltage source
+                    parts = re.split(r'[()]', line)
+                    if len(parts) > 1:
+                        # optional args from inside parenthesis
+                        words0 = re.split(r'[ \t]+', parts[0])
+                        args = words0[-1:] + re.split(r'[ \t]+', parts[1])
+                        # value: AC, DC keywords and values
+                        value = words0[3:-1]
+                        if len(parts) > 2 and len(p2 := parts[2].strip()) > 0:
+                            value += re.split(r'[ \t]+', p2)
+                    elif len(words) > 4:
+                        # no parenthesis, but separate out AC, DC anyway
+                        value = words[3:]
+                        for i, w in enumerate(value):
+                            if not (w[0].isdigit() or w in ('ac', 'dc')):
+                                args = value[i:]
+                                value = value[:i]
+                                break
+
+                elif ty in 'clr':
+                    # passive
+                    value = si.floatSI(value)
+
+                if verbose >= 2:
+                    print(f"{indent}-> {comp} {node1} {node2} {value}")
+                if comp in comps:
+                    raise ValueError(f"Duplicate component {comp}")
+
+                edge_nm = f"{node1},:{comp},{node2}"
+                edge_dir = 1
+                if node1 > node2:
+                    edge_dir = -1
+                    if type(value) == type(1.0):
+                        value = -value
+                    edge_nm = f"{node2},:{comp},{node1}"
+                # would like to use objects, but they're ~4 times slower
+                comps[comp] = (edge_nm, edge_dir, value, args)
+                if not edge_nm in edges:
+                    edges[edge_nm] = []
+                edges[edge_nm].append(comp)
+
+                if node1 not in graph:
+                    graph[node1] = []
+                if node2 not in graph:
+                    graph[node2] = []
+                graph[node1].append((node2, comp))
+                graph[node2].append((node1, comp))
+
+
+def parse_deck(deck):
+    """Parse a Spice file"""
+    global graph, comps, edges, subckts, title
+    graph = {}
+    comps = {}
+    edges = {}
+    subckts = {}
+
+    with open(deck) as f:
+        lines = f.readlines()
+        title = lines[0].strip()
+        subckt_name = None
+        args = None
+        subckt_lines = []
+        in_subckt = False
+        lines2 = []
+
+        # pass 1: gather subcircuits and model definitions
+        for line in lines[1:]:
+            line = line.split('*')[0].strip()
+            if line == '':
+                continue
+
+            words = re.split("[\s\t]+", line.lower())
+            cmd = words[0][:5]
+            if cmd == '.subc':
+                in_subckt = True
+                subckt_name = words[1]
+                args = words[2:]
+
+            elif in_subckt:
+                if cmd == '.ends':
+                    in_subckt = False
+                    subckts[subckt_name] = (args, subckt_lines)
+                    subckt_lines = []
+                else:
+                    subckt_lines.append(line)
+
+            else:
+                lines2.append(line)
+
+        if verbose >= 1:
+            print("subckts:\n")
+            for name, (args, lines) in subckts.items():
+                print(f"{name}({args}) =")
+                print("\n".join(lines))
+                print()
+            print()
+
+        # pass 2: gather components and construct graph
+        parse_sub(None, lines2)
+
+
 def print_graph():
     print("\ngraph:")
     for name, nodes in graph.items():
-        print(f"  {name}: ({', '.join([':'.join(x) for x in nodes])})")
+        print(f"  {name}: ({', '.join(['|'.join(x) for x in nodes])})")
 
 
 def print_comps():
     print("\ncomps:")
-    for comp, (edge_name, edge_dir, value) in comps.items():
-        print(f"  {comp} {edge_name} {edge_dir} {si.si(value)}")
+    for comp, (edge_name, edge_dir, value, args) in comps.items():
+        if type(value) == type(1.0):
+            value = si.si(value)
+        print(f"  {comp} ({edge_name} {edge_dir} {value} {args})")
 
 
 def compile_and_run(deck):
