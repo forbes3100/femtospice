@@ -1,6 +1,7 @@
 lpf17tr Low Pass Filter, transient
 
 vs vs 0 pwl(0 0 1ps 1) dc 0
+* vs vs 0 pwl(0 0 2ns 0.3 7.3ns 0.35 10ns 1) dc 0
 
 * 7th order 200 MHz LPF, 0.1dB ripple
 R1 vs v3 50
@@ -20,9 +21,10 @@ destroy all
 run
 set noaskquit
 
-plot v(v3) v(v4) v(v5) v(v6) v(ideal)*2
+plot v(v3) v(v4) v(v5) v(v6) v(ideal)
 linearize v(v3) v(v4) v(v5) v(v6) v(ideal)
-print v(v3) v(v4) v(v5) v(v6) v(ideal)
+* print v(v3) v(v4) v(v5) v(v6) v(ideal)
+* server v(c1)
 
 .endcontrol
 .end
